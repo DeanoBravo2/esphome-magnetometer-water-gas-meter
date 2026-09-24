@@ -12,14 +12,14 @@ substitutions:
   # For gas one of: CCF, ft³, m³
   volume_unit: 'gal'
 
-  i2c_scl: GPIO5  # D1
-  i2c_sda: GPIO4  # D2
+  i2c_scl: GPIO42 # D1
+  i2c_sda: GPIO41 # D2
 
   # Set these only if you have connected two QMC5883L to one device, see esphome-two-meters.yaml
   prefix_name: ''
   prefix_id: ''
 
-  qmc5883l_update_interval: '5ms'
+  qmc5883l_update_interval: '20ms'
   qmc5883l_oversampling: '64x'
 
   volume_per_half_rotation_initial_value: '0.01008156'
@@ -30,8 +30,8 @@ substitutions:
   # Reduces Wi-Fi traffic and Home Assistant database growth.
   magnetic_field_update_delta: '3'
 
-  hide_magnetic_field_strength_sensors: 'true'
-  hide_half_rotations_total_sensor: 'true'
+  hide_magnetic_field_strength_sensors: 'false'
+  hide_half_rotations_total_sensor: 'false'
 
   # Tuning parameters for the Min/Max Tracker algorithm:
   # Decay rate per tick (~5ms). Controls how fast the tracker follows thermal drift.
