@@ -1,0 +1,609 @@
+---
+# This config uses the QMC5883L, a triple-axis magnetometer, to read your water meter or gas meter.
+
+substitutions:
+  # water or gas
+  device_class: 'water'
+
+  # mdi:water or mdi:meter-gas
+  device_icon: 'mdi:water'
+
+  # For water one of: CCF, ft³, gal, L, m³
+  # For gas one of: CCF, ft³, m³
+  volume_unit: 'gal'
+
+  i2c_scl: GPIO5  # D1
+  i2c_sda: GPIO4  # D2
+
+  # Set these only if you have connected two QMC5883L to one device, see esphome-two-meters.yaml
+  prefix_name: ''
+  prefix_id: ''
+
+  qmc5883l_update_interval: '5ms'
+  qmc5883l_oversampling: '64x'
+
+  volume_per_half_rotation_initial_value: '0.01008156'
+  calibration_minimal_axis_range_initial_value: '20'
+  flow_update_interval_seconds: '10'
+
+  # Only publish updates if the magnetic field changes by at least this amount (in µT).
+  # Reduces Wi-Fi traffic and Home Assistant database growth.
+  magnetic_field_update_delta: '3'
+
+  hide_magnetic_field_strength_sensors: 'true'
+  hide_half_rotations_total_sensor: 'true'
+
+  # Tuning parameters for the Min/Max Tracker algorithm:
+  # Decay rate per tick (~5ms). Controls how fast the tracker follows thermal drift.
+  # 0.0005 = ~6 µT/min. Increase if you see false triggers from temperature changes.
+  tracker_decay_rate: '0.0005'
+  # Minimum span as fraction of calibrated magnet_span. Keeps the detection window
+  # open when flow stops, ensuring slow leaks are still detected.
+  # 0.8 = window stays at 80% of calibrated size.
+  min_span_multiplier: '0.8'
+  # Maximum span as fraction of calibrated magnet_span.
+  # If the calculated span exceeds this (e.g., due to bad initialization or huge signal jump),
+  # the opposite tracker is dragged along to maintain the maximum allowed size.
+  # 1.1 = Max allowed window is 120% of calibrated size.
+  max_span_multiplier: '1.2'
+
+esphome:
+  min_version: "2026.1.0"
+  # Default loop interval is 16ms. Setting it to 0 to make updates faster.
+  # Without setting this, the actual update interval of qmc5883l is: 6ms on ESP32, 10ms on ESP8266.
+  # With this, it's 5ms on ESP32, 8ms on ESP8266.
+  on_boot:
+    then:
+      - lambda: App.set_loop_interval(0);
+
+logger:
+  level: INFO
+  logs:
+    qmc5883l: INFO
+
+api:
+  services:
+    # Based on https://esphome.io/components/sensor/pulse_meter.html#re-setting-the-total-pulse-count
+    # Useful if you would like the total sensor to match what you see on your meter you are trying to match.
+    - service: ${prefix_id}set_total
+      variables:
+        new_total: float
+      then:
+        - globals.set:
+            id: ${prefix_id}half_rotations_total
+            value: !lambda 'return new_total / id(${prefix_id}volume_per_half_rotation).state;'
+
+globals:
+  - id: ${prefix_id}half_rotations_total
+    type: long
+    restore_value: true
+    initial_value: '0'
+  - id: ${prefix_id}half_rotations_flow
+    type: long
+    restore_value: false
+    initial_value: '0'
+  - id: ${prefix_id}axis_value_high
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ${prefix_id}calibrating
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: ${prefix_id}axis_x_value
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: ${prefix_id}axis_y_value
+    type: float
+    restore_value: false
+    initial_value: '0'
+  - id: ${prefix_id}axis_z_value
+    type: float
+    restore_value: false
+    initial_value: '0'
+
+  # TRACKERS for Min/Max Algorithm (initialized to NAN, set on first reading)
+  - id: ${prefix_id}track_min
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+  - id: ${prefix_id}track_max
+    type: float
+    restore_value: false
+    initial_value: 'NAN'
+
+  # Calibration Vars
+  - id: ${prefix_id}calibrating_axis_x_min
+    type: float
+    restore_value: false
+  - id: ${prefix_id}calibrating_axis_x_max
+    type: float
+    restore_value: false
+  - id: ${prefix_id}calibrating_axis_y_min
+    type: float
+    restore_value: false
+  - id: ${prefix_id}calibrating_axis_y_max
+    type: float
+    restore_value: false
+  - id: ${prefix_id}calibrating_axis_z_min
+    type: float
+    restore_value: false
+  - id: ${prefix_id}calibrating_axis_z_max
+    type: float
+    restore_value: false
+
+number:
+  - platform: template
+    id: ${prefix_id}volume_per_half_rotation
+    name: ${prefix_name}Volume per half rotation
+    entity_category: config
+    mode: box
+    min_value: 0
+    max_value: 9999999
+    step: 0.000000001
+    initial_value: ${volume_per_half_rotation_initial_value}
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: ${volume_unit}
+    icon: mdi:rotate-360
+
+  - platform: template
+    id: ${prefix_id}temperature_offset
+    name: ${prefix_name}Temperature Offset
+    unit_of_measurement: '°C'
+    min_value: -100
+    max_value: 100
+    step: 0.1
+    mode: box
+    update_interval: never
+    optimistic: true
+    restore_value: true
+    initial_value: 33
+    icon: 'mdi:thermometer'
+    entity_category: config
+
+  - platform: template
+    id: ${prefix_id}magnet_span
+    name: ${prefix_name}Magnet Span
+    entity_category: config
+    mode: box
+    min_value: 1.0
+    max_value: 2000
+    step: 0.1
+    initial_value: 40.0
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: µT
+    icon: mdi:arrow-expand-vertical
+
+  - platform: template
+    id: ${prefix_id}threshold_lower
+    name: ${prefix_name}Threshold lower
+    entity_category: config
+    mode: box
+    min_value: -9999
+    max_value: 9999
+    step: 0.1
+    initial_value: -9999
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: µT
+    icon: mdi:arrow-collapse-down
+
+  - platform: template
+    id: ${prefix_id}threshold_upper
+    name: ${prefix_name}Threshold upper
+    entity_category: config
+    mode: box
+    min_value: -9999
+    max_value: 9999
+    step: 0.1
+    initial_value: 9999
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: µT
+    icon: mdi:arrow-collapse-up
+
+  - platform: template
+    id: ${prefix_id}calibration_minimal_axis_range
+    name: ${prefix_name}Calibration minimal axis range
+    entity_category: config
+    icon: mdi:sine-wave
+    mode: box
+    min_value: 10
+    max_value: 20
+    step: 1
+    initial_value: ${calibration_minimal_axis_range_initial_value}
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: µT
+
+  - platform: template
+    id: ${prefix_id}calibration_seconds
+    name: ${prefix_name}Calibration time
+    entity_category: config
+    icon: mdi:timer
+    mode: box
+    min_value: 1
+    max_value: 999
+    step: 1
+    initial_value: 5
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: s
+
+select:
+  - platform: template
+    id: ${prefix_id}axis
+    name: ${prefix_name}Axis
+    entity_category: config
+    icon: mdi:axis-arrow
+    options:
+      - x
+      - y
+      - z
+      - None
+    initial_option: None
+    update_interval: never
+    restore_value: true
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x == "None") {
+              id(${prefix_id}calibration_status).publish_state("Not Calibrated");
+            } else if (!id(${prefix_id}calibrating)) {
+              id(${prefix_id}calibration_status).publish_state("Ready");
+            }
+
+  - platform: template
+    id: ${prefix_id}detection_algorithm
+    name: ${prefix_name}Detection algorithm
+    entity_category: config
+    icon: mdi:auto-fix
+    options:
+      - Adaptive
+      - Threshold
+    initial_option: Adaptive
+    update_interval: never
+    restore_value: true
+    optimistic: true
+
+text_sensor:
+  - platform: template
+    id: ${prefix_id}calibration_status
+    name: ${prefix_name}Calibration Status
+    entity_category: diagnostic
+    icon: mdi:information-outline
+    update_interval: never
+
+button:
+  - platform: template
+    id: ${prefix_id}calibrate_button
+    name: ${prefix_name}Calibrate axis
+    entity_category: config
+    icon: mdi:tune
+    on_press:
+      - lambda: |-
+          ESP_LOGI("calibration", "Starting calibration. Make sure ${device_class} is running");
+          id(${prefix_id}calibration_status).publish_state("Calibrating...");
+          id(${prefix_id}calibrating_axis_x_min) = std::numeric_limits<float>::max();
+          id(${prefix_id}calibrating_axis_x_max) = std::numeric_limits<float>::lowest();
+          id(${prefix_id}calibrating_axis_y_min) = std::numeric_limits<float>::max();
+          id(${prefix_id}calibrating_axis_y_max) = std::numeric_limits<float>::lowest();
+          id(${prefix_id}calibrating_axis_z_min) = std::numeric_limits<float>::max();
+          id(${prefix_id}calibrating_axis_z_max) = std::numeric_limits<float>::lowest();
+          id(${prefix_id}calibrating) = true;
+      - delay: !lambda return id(${prefix_id}calibration_seconds).state * 1000;
+      - lambda: |-
+          id(${prefix_id}calibrating) = false;
+          float x_range = id(${prefix_id}calibrating_axis_x_max) - id(${prefix_id}calibrating_axis_x_min);
+          float y_range = id(${prefix_id}calibrating_axis_y_max) - id(${prefix_id}calibrating_axis_y_min);
+          float z_range = id(${prefix_id}calibrating_axis_z_max) - id(${prefix_id}calibrating_axis_z_min);
+          float min_axis_range = id(${prefix_id}calibration_minimal_axis_range).state;
+          // Log diagnostic info for each axis
+          if (x_range < 0) {
+            ESP_LOGW("${prefix_id}calibration", "Didn't get any values for x");
+          } else {
+            ESP_LOGI("${prefix_id}calibration", "x ranged from %.2f to %.2f (range: %.2f)",
+                     id(${prefix_id}calibrating_axis_x_min), id(${prefix_id}calibrating_axis_x_max), x_range);
+          }
+          if (y_range < 0) {
+            ESP_LOGW("${prefix_id}calibration", "Didn't get any values for y");
+          } else {
+            ESP_LOGI("${prefix_id}calibration", "y ranged from %.2f to %.2f (range: %.2f)",
+                     id(${prefix_id}calibrating_axis_y_min), id(${prefix_id}calibrating_axis_y_max), y_range);
+          }
+          if (z_range < 0) {
+            ESP_LOGW("${prefix_id}calibration", "Didn't get any values for z");
+          } else {
+            ESP_LOGI("${prefix_id}calibration", "z ranged from %.2f to %.2f (range: %.2f)",
+                     id(${prefix_id}calibrating_axis_z_min), id(${prefix_id}calibrating_axis_z_max), z_range);
+          }
+          std::string axis_with_largest_range;
+          float min, max;
+          float max_range_found = 0;
+          if (x_range > min_axis_range && x_range > y_range && x_range > z_range) {
+            axis_with_largest_range = "x";
+            min = id(${prefix_id}calibrating_axis_x_min);
+            max = id(${prefix_id}calibrating_axis_x_max);
+            max_range_found = x_range;
+          } else if (y_range > min_axis_range && y_range > x_range && y_range > z_range) {
+            axis_with_largest_range = "y";
+            min = id(${prefix_id}calibrating_axis_y_min);
+            max = id(${prefix_id}calibrating_axis_y_max);
+            max_range_found = y_range;
+          } else if (z_range > min_axis_range && z_range > x_range && z_range > y_range) {
+            axis_with_largest_range = "z";
+            min = id(${prefix_id}calibrating_axis_z_min);
+            max = id(${prefix_id}calibrating_axis_z_max);
+            max_range_found = z_range;
+          } else {
+            ESP_LOGE("${prefix_id}calibration", "Calibration failed. No axis had a range of at least %.0f", min_axis_range);
+            id(${prefix_id}calibration_status).publish_state("Failed: low signal");
+            return;
+          }
+
+          id(${prefix_id}axis).make_call().set_option(axis_with_largest_range).perform();
+
+          // Set magnet span for adaptive algorithm
+          id(${prefix_id}magnet_span).make_call().set_value(roundf(max_range_found * 10) / 10).perform();
+          id(${prefix_id}track_max) = NAN;
+          id(${prefix_id}track_min) = NAN;
+
+          // Set thresholds for threshold-based algorithm
+          float tolerance = 5 / (20.0 / min_axis_range);
+          float lower_threshold = min + (max - min) / 2 - tolerance;
+          float upper_threshold = min + (max - min) / 2 + tolerance;
+          id(${prefix_id}threshold_lower).make_call().set_value(roundf(lower_threshold * 10) / 10).perform();
+          id(${prefix_id}threshold_upper).make_call().set_value(roundf(upper_threshold * 10) / 10).perform();
+
+          ESP_LOGI("${prefix_id}calibration", "Calibration complete: axis=%s, span=%.2f, thresholds=[%.1f, %.1f]",
+                   axis_with_largest_range.c_str(), max_range_found, lower_threshold, upper_threshold);
+
+i2c:
+  - id: ${prefix_id}i2c_bus
+    scl: ${i2c_scl}
+    sda: ${i2c_sda}
+    frequency: 50kHz
+    scan: false
+
+sensor:
+  # Holds the magnetic field strength value of x, y, or z depending on the axis template select.
+  # Increments counters when value crosses thresholds.
+  - platform: template
+    id: ${prefix_id}axis_value
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            if (id(${prefix_id}detection_algorithm).current_option() == "Adaptive") {
+              // === ADAPTIVE ALGORITHM: Min/Max Tracker with Range Clamping ===
+              std::string active_axis = id(${prefix_id}axis).current_option();
+              float secondary_value = 0.0f;
+              if (active_axis == "x") {
+                secondary_value = id(${prefix_id}axis_y_value);
+              } else if (active_axis == "y") {
+                secondary_value = id(${prefix_id}axis_x_value);
+              } else if (active_axis == "z") {
+                secondary_value = id(${prefix_id}axis_y_value);
+              }
+
+              // Experimental cross-axis sanity check. The selected axis remains the primary trigger,
+              // but the other correlated axis must be moving in the same direction before a pulse is counted.
+              bool same_direction = ((x >= 0.0f && secondary_value >= 0.0f) || (x < 0.0f && secondary_value < 0.0f));
+              bool secondary_has_signal = fabs(secondary_value) > 0.5f;
+              bool sanity_check_passed = !secondary_has_signal || same_direction;
+
+              // 1. Initialize Trackers if empty (NAN on boot or after calibration)
+              if (std::isnan(id(${prefix_id}track_max)) || std::isnan(id(${prefix_id}track_min))) {
+                 id(${prefix_id}track_max) = x + (id(${prefix_id}magnet_span).state / 2.0);
+                 id(${prefix_id}track_min) = x - (id(${prefix_id}magnet_span).state / 2.0);
+              }
+
+              // 2. Linear Decay (Very Slow) - pulls max down and min up to follow thermal drift
+              float decay = ${tracker_decay_rate};
+              id(${prefix_id}track_max) -= decay;
+              id(${prefix_id}track_min) += decay;
+
+              // 3. Expand Trackers based on current signal AND Clamp Span
+              float max_allowed_span = id(${prefix_id}magnet_span).state * ${max_span_multiplier};
+
+              if (x > id(${prefix_id}track_max)) {
+                id(${prefix_id}track_max) = x;
+                // If expanding Max makes the window too huge, drag Min up
+                if ((id(${prefix_id}track_max) - id(${prefix_id}track_min)) > max_allowed_span) {
+                   id(${prefix_id}track_min) = id(${prefix_id}track_max) - max_allowed_span;
+                }
+              }
+              if (x < id(${prefix_id}track_min)) {
+                id(${prefix_id}track_min) = x;
+                // If expanding Min makes the window too huge, drag Max down
+                if ((id(${prefix_id}track_max) - id(${prefix_id}track_min)) > max_allowed_span) {
+                   id(${prefix_id}track_max) = id(${prefix_id}track_min) + max_allowed_span;
+                }
+              }
+
+              // 4. Enforce Minimum Span - prevents window from collapsing when flow stops
+              float min_span = id(${prefix_id}magnet_span).state * ${min_span_multiplier};
+              float current_span = id(${prefix_id}track_max) - id(${prefix_id}track_min);
+
+              if (current_span < min_span) {
+                 float correction = (min_span - current_span) / 2.0;
+                 id(${prefix_id}track_max) += correction;
+                 id(${prefix_id}track_min) -= correction;
+              }
+
+              // 5. Calculate Center and Hysteresis (25% of window size)
+              float midpoint = (id(${prefix_id}track_max) + id(${prefix_id}track_min)) / 2.0;
+              float hyst = (id(${prefix_id}track_max) - id(${prefix_id}track_min)) * 0.25;
+
+              // 6. Trigger Logic with experimental cross-axis sanity check
+              if (sanity_check_passed && x > (midpoint + hyst) && !id(${prefix_id}axis_value_high)) {
+                id(${prefix_id}axis_value_high) = true;
+                id(${prefix_id}half_rotations_total) += 1;
+                id(${prefix_id}half_rotations_flow) += 1;
+                id(led).turn_on();
+              } else if (sanity_check_passed && x < (midpoint - hyst) && id(${prefix_id}axis_value_high)) {
+                id(${prefix_id}axis_value_high) = false;
+                id(led).turn_off();
+              }
+              return;
+            }
+            // === THRESHOLD ALGORITHM: Fixed thresholds ===
+            // Threshold mode remains single-axis for now, but the cross-axis state is still tracked
+            // so it can be tested against the adaptive detector during low-flow operation.
+            if (x > id(${prefix_id}threshold_upper).state && !id(${prefix_id}axis_value_high)) {
+              id(${prefix_id}axis_value_high) = true;
+              id(${prefix_id}half_rotations_total) += 1;
+              id(${prefix_id}half_rotations_flow) += 1;
+              id(led).turn_on();
+            } else if (x < id(${prefix_id}threshold_lower).state && id(${prefix_id}axis_value_high)) {
+              id(${prefix_id}axis_value_high) = false;
+              id(led).turn_off();
+            }
+
+  # https://esphome.io/components/sensor/qmc5883l.html
+  - platform: qmc5883l
+    id: ${prefix_id}qmc5883l_id
+    i2c_id: ${prefix_id}i2c_bus
+    address: 0x0D
+    field_strength_x:
+      id: ${prefix_id}qmc5883l_axis_x
+      name: ${prefix_name}Magnetic Field Strength X
+      internal: ${hide_magnetic_field_strength_sensors}
+      entity_category: diagnostic
+      on_raw_value:
+        then:
+          - lambda: |-
+              id(${prefix_id}axis_x_value) = x;
+              if (id(${prefix_id}axis).current_option() == "x") id(${prefix_id}axis_value).publish_state(x);
+              if (id(${prefix_id}calibrating)) {
+                id(${prefix_id}calibrating_axis_x_min) = min(id(${prefix_id}calibrating_axis_x_min), x);
+                id(${prefix_id}calibrating_axis_x_max) = max(id(${prefix_id}calibrating_axis_x_max), x);
+              }
+      filters:
+        - delta: ${magnetic_field_update_delta}
+    field_strength_y:
+      id: ${prefix_id}qmc5883l_axis_y
+      name: ${prefix_name}Magnetic Field Strength Y
+      internal: ${hide_magnetic_field_strength_sensors}
+      entity_category: diagnostic
+      on_raw_value:
+        then:
+          - lambda: |-
+              id(${prefix_id}axis_y_value) = x;
+              if (id(${prefix_id}axis).current_option() == "y") id(${prefix_id}axis_value).publish_state(x);
+              if (id(${prefix_id}calibrating)) {
+                id(${prefix_id}calibrating_axis_y_min) = min(id(${prefix_id}calibrating_axis_y_min), x);
+                id(${prefix_id}calibrating_axis_y_max) = max(id(${prefix_id}calibrating_axis_y_max), x);
+              }
+      filters:
+        - delta: ${magnetic_field_update_delta}
+    field_strength_z:
+      id: ${prefix_id}qmc5883l_axis_z
+      name: ${prefix_name}Magnetic Field Strength Z
+      internal: ${hide_magnetic_field_strength_sensors}
+      entity_category: diagnostic
+      on_raw_value:
+        then:
+          - lambda: |-
+              id(${prefix_id}axis_z_value) = x;
+              if (id(${prefix_id}axis).current_option() == "z") id(${prefix_id}axis_value).publish_state(x);
+              if (id(${prefix_id}calibrating)) {
+                id(${prefix_id}calibrating_axis_z_min) = min(id(${prefix_id}calibrating_axis_z_min), x);
+                id(${prefix_id}calibrating_axis_z_max) = max(id(${prefix_id}calibrating_axis_z_max), x);
+              }
+      filters:
+        - delta: ${magnetic_field_update_delta}
+    temperature:
+      id: ${prefix_id}qmc5883l_temperature
+      name: ${prefix_name}Temperature
+      filters:
+        - lambda: "return x + id(${prefix_id}temperature_offset).state;"
+        - sliding_window_moving_average:
+            window_size: 3000
+            send_every: 3000
+        - or:
+            - throttle: 300s
+            - delta: 0.5
+    oversampling: ${qmc5883l_oversampling}
+    update_interval: ${qmc5883l_update_interval}
+
+  - platform: template
+    id: ${prefix_id}sensor_track_min
+    name: ${prefix_name}Track Min
+    lambda: return id(${prefix_id}track_min);
+    update_interval: 1s
+    internal: ${hide_magnetic_field_strength_sensors}
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    unit_of_measurement: µT
+    icon: mdi:arrow-collapse-down
+    filters:
+      - delta: ${magnetic_field_update_delta}
+
+  - platform: template
+    id: ${prefix_id}sensor_track_max
+    name: ${prefix_name}Track Max
+    lambda: return id(${prefix_id}track_max);
+    update_interval: 1s
+    internal: ${hide_magnetic_field_strength_sensors}
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    unit_of_measurement: µT
+    icon: mdi:arrow-collapse-up
+    filters:
+      - delta: ${magnetic_field_update_delta}
+
+  - platform: template
+    id: ${prefix_id}sensor_half_rotations_total
+    name: ${prefix_name}Half rotations total
+    lambda: return id(${prefix_id}half_rotations_total);
+    update_interval: 1s
+    internal: ${hide_half_rotations_total_sensor}
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    state_class: 'total_increasing'
+    icon: 'mdi:counter'
+    filters:
+      - delta: 1
+
+  - platform: template
+    id: ${prefix_id}sensor_total
+    name: ${prefix_name}Total
+    lambda: return id(${prefix_id}half_rotations_total) * id(${prefix_id}volume_per_half_rotation).state;
+    update_interval: 10s
+    accuracy_decimals: 2
+    device_class: ${device_class}
+    icon: ${device_icon}
+    state_class: total_increasing
+    unit_of_measurement: ${volume_unit}
+    filters:
+      - or:
+          - throttle: 60s
+          - delta: 0
+
+  - platform: template
+    id: ${prefix_id}sensor_flow
+    name: ${prefix_name}Flow
+    icon: mdi:speedometer
+    lambda: |-
+      float flow = id(${prefix_id}half_rotations_flow) * id(${prefix_id}volume_per_half_rotation).state * 60.0 / ${flow_update_interval_seconds};
+      id(${prefix_id}half_rotations_flow) = 0;
+      return flow;
+    update_interval: ${flow_update_interval_seconds}s
+    accuracy_decimals: 2
+    state_class: measurement
+    unit_of_measurement: ${volume_unit}/min
+    filters:
+      - or:
+          - throttle: 60s
+          - delta: 0
