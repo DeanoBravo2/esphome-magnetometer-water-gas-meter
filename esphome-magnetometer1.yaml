@@ -22,7 +22,8 @@ substitutions:
   qmc5883l_update_interval: '20ms'
   qmc5883l_oversampling: '64x'
 
-  volume_per_half_rotation_initial_value: '0.01008156'
+  volume_per_half_rotation_initial_value: '0.04277892' #Badger RCDL 70 Meter
+  
   calibration_minimal_axis_range_initial_value: '20'
   flow_update_interval_seconds: '10'
 
